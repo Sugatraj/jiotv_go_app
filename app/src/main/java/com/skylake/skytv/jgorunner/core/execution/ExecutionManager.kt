@@ -6,39 +6,27 @@ import android.os.Build
 import androidx.activity.ComponentActivity
 import com.skylake.skytv.jgorunner.data.SkySharedPref
 import com.skylake.skytv.jgorunner.services.BinaryService
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 
-fun runBinary(
+suspend fun runBinary(
     activity: ComponentActivity,
     arguments: Array<String>,
-    onRunSuccess: () -> Unit,
     onOutput: (String) -> Unit,
     forceStart: Boolean = false
-) {
-    // If already running and not forcing a restart, skip re-starting
+): Boolean {
     if (BinaryService.isRunning && !forceStart) {
-        onRunSuccess()
-        CoroutineScope(Dispatchers.Main).launch {
-            BinaryService.instance?.binaryOutput?.observe(activity) { output ->
-                onOutput(output)
-            }
-        }
-        return
+        BinaryService.instance?.binaryOutput?.observe(activity) { onOutput(it) }
+        return true
     }
+
     val preferenceManager = SkySharedPref.getInstance(activity)
     val intent = Intent(activity, BinaryService::class.java).apply {
         putExtra(
             "binaryFileLocation",
             preferenceManager.myPrefs.jtvGoBinaryName?.let {
-                File(
-                    activity.filesDir,
-                    it
-                ).absolutePath
+                File(activity.filesDir, it).absolutePath
             })
         putExtra("arguments", arguments)
     }
@@ -49,17 +37,15 @@ fun runBinary(
         activity.startService(intent)
     }
 
-    CoroutineScope(Dispatchers.IO).launch {
-        // Wait until the binary service is running
+    val started = withTimeoutOrNull(10_000L) {
         while (!BinaryService.isRunning) delay(100)
+        true
+    } ?: false
 
-        onRunSuccess()
-        withContext(Dispatchers.Main) {
-            BinaryService.instance?.binaryOutput?.observe(activity) { output ->
-                onOutput(output)
-            }
-        }
+    if (started) {
+        BinaryService.instance?.binaryOutput?.observe(activity) { onOutput(it) }
     }
+    return started
 }
 
 fun stopBinary(

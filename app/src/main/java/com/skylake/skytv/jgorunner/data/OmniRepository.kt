@@ -58,8 +58,7 @@ class OmniRepository(private val context: Context) {
             val request = Request.Builder().url(url).build()
             val m3uChannels = client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    LogCollector.log("OmniRepository: M3U request failed with code ${response.code}")
-                    return@withContext emptyList()
+                    throw java.io.IOException("Channel request failed with HTTP ${response.code}")
                 }
                 val body = response.body?.string() ?: ""
                 parseM3U(body, "http://127.0.0.1:$port")
@@ -90,7 +89,8 @@ class OmniRepository(private val context: Context) {
                         if (subscriptionMap.isNotEmpty()) {
                             LogCollector.log("OmniRepository: Enriched ${subscriptionMap.size} premium channels with subscription requirements")
                             finalChannels = m3uChannels.map { ch ->
-                                val requiresSub = ch.id != null && subscriptionMap[ch.id] == true
+                                val serverChannelId = stableChannelId(null, ch.url)
+                                val requiresSub = serverChannelId != null && subscriptionMap[serverChannelId] == true
                                 ch.copy(requiresSubscription = requiresSub)
                             }
                         }
@@ -113,7 +113,7 @@ class OmniRepository(private val context: Context) {
             finalChannels
         } catch (e: Exception) {
             LogCollector.logError("OmniRepository: Error fetching channels", e)
-            emptyList()
+            throw e
         }
     }
 
@@ -121,6 +121,7 @@ class OmniRepository(private val context: Context) {
         val channels = mutableListOf<OmniChannel>()
         val lines = body.trimStart('\uFEFF').split("\n")
         var name: String? = null
+        var tvgId: String? = null
         var logo: String? = null
         var group: String? = null
         var language: String? = null
@@ -136,6 +137,7 @@ class OmniRepository(private val context: Context) {
             if (line.startsWith("#EXTINF", ignoreCase = true)) {
                 val nm = Regex("""tvg-name="([^"]*)"""", RegexOption.IGNORE_CASE).find(line)
                 name = nm?.groupValues?.get(1)?.trim() ?: line.split(",").lastOrNull()?.trim()
+                tvgId = Regex("""tvg-id="([^"]*)"""", RegexOption.IGNORE_CASE).find(line)?.groupValues?.get(1)?.trim()
                 val lg = Regex("""tvg-logo="([^"]*)"""", RegexOption.IGNORE_CASE).find(line)
                 logo = lg?.groupValues?.get(1)?.trim()
                 val gr = Regex("""group-title="([^"]*)"""", RegexOption.IGNORE_CASE).find(line)
@@ -196,28 +198,23 @@ class OmniRepository(private val context: Context) {
                     }
                 }
 
-                val extractedId = streamUrl
-                    .substringAfterLast("/")
-                    .substringBefore("?")
-                    .substringBefore(".")
-                    .trim()
-                    .ifBlank { name.hashCode().toString() }
-
                 val isLocalJio = streamUrl.contains("127.0.0.1") || streamUrl.contains("localhost")
                 val isLiveOrPlay = streamUrl.contains("/live/") || streamUrl.contains("/play/")
+                val routeId = stableChannelId(null, streamUrl)
+                val channelId = stableChannelId(tvgId, streamUrl)
                 val base = if (streamUrl.contains("/live/")) streamUrl.substringBefore("/live/") 
                            else if (streamUrl.contains("/play/")) streamUrl.substringBefore("/play/")
                            else localBaseUrl
 
                 // Local JioTV Go binary MPD manifest endpoint is /live/mpd/{id} (NO .mpd extension!)
-                val derivedMpdUrl = if (isLocalJio && isLiveOrPlay) {
-                    "$base/live/mpd/$extractedId"
+                val derivedMpdUrl = if (isLocalJio && isLiveOrPlay && routeId != null) {
+                    "$base/live/mpd/$routeId"
                 } else if (manifestType == "dash" || streamUrl.contains(".mpd", true)) {
                     streamUrl
                 } else null
 
-                val derivedKeyUrl = licenseUrl ?: if (isLocalJio && isLiveOrPlay) {
-                    "$base/live/key/$extractedId"
+                val derivedKeyUrl = licenseUrl ?: if (isLocalJio && isLiveOrPlay && routeId != null) {
+                    "$base/live/key/$routeId"
                 } else null
 
                 val resolvedLogo = when {
@@ -239,7 +236,7 @@ class OmniRepository(private val context: Context) {
 
                 channels.add(
                     OmniChannel(
-                        id = extractedId,
+                        id = channelId,
                         name = name,
                         group = group?.ifBlank { "General" } ?: "General",
                         language = language?.ifBlank { "Hindi" } ?: "Hindi",
@@ -253,7 +250,7 @@ class OmniRepository(private val context: Context) {
                     )
                 )
 
-                name = null; logo = null; group = null; language = null; licenseUrl = null; manifestType = null; requiresSubscription = false
+                name = null; tvgId = null; logo = null; group = null; language = null; licenseUrl = null; manifestType = null; requiresSubscription = false
                 headers.clear()
             }
         }

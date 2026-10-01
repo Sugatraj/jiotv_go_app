@@ -64,10 +64,14 @@ import com.skylake.skytv.jgorunner.activities.OmniPlayerActivity
 import com.skylake.skytv.jgorunner.activities.WebPlayerActivity
 import com.skylake.skytv.jgorunner.data.OmniRepository
 import com.skylake.skytv.jgorunner.data.SkySharedPref
+import com.skylake.skytv.jgorunner.data.StartupChannelMode
+import com.skylake.skytv.jgorunner.data.resolveFixedChannel
+import com.skylake.skytv.jgorunner.data.resolveLastPlayedChannel
 import com.skylake.skytv.jgorunner.data.OmniFavoritesStore
 import com.skylake.skytv.jgorunner.ui.tvhome.OmniChannel
 import com.skylake.skytv.jgorunner.ui.tvhome.EpgProgram
 import com.skylake.skytv.jgorunner.ui.tvhome.EpgResponse
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -112,7 +116,15 @@ data class OmniServer(
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
 @Composable
-fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
+fun OmniMainScreen(
+    context: Context,
+    onNavigate: (String) -> Unit,
+    startupStatus: String?,
+    startupReady: Boolean,
+    startupRetryAvailable: Boolean,
+    onRetryStartup: () -> Unit,
+    onStartupChannelsLoaded: () -> Unit
+) {
     val prefManager = remember { SkySharedPref.getInstance(context) }
     val repository = remember { OmniRepository(context) }
     val port = prefManager.myPrefs.jtvGoServerPort
@@ -170,6 +182,13 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
     var showCategoryDialog by remember { mutableStateOf(false) }
     var showLanguageDialog by remember { mutableStateOf(false) }
     var showAutoOpenServerDialog by remember { mutableStateOf(false) }
+    var showStartupChannelDialog by remember { mutableStateOf(false) }
+    var showFixedChannelDialog by remember { mutableStateOf(false) }
+    var isLoadingFixedChannels by remember { mutableStateOf(false) }
+    var startupMode by remember {
+        mutableStateOf(StartupChannelMode.fromPreference(prefManager.myPrefs.omniStartupChannelMode))
+    }
+    var startupNotice by remember { mutableStateOf<String?>(null) }
     var autoOpenServerName by remember {
         mutableStateOf(if (prefManager.myPrefs.omniAutoOpenServer == FAVORITES_SERVER_URL || prefManager.myPrefs.omniAutoOpenServer?.equals("Favorites", ignoreCase = true) == true) "Favorites" else "Jio")
     }
@@ -196,10 +215,6 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
     val favoritesStore = remember { OmniFavoritesStore(prefManager) }
     var gridColumnCount by remember(settingsUpdateTrigger) { mutableIntStateOf(prefManager.myPrefs.omniGridColumnCount ?: 0) }
     var showGridColumnDialog by remember { mutableStateOf(false) }
-
-    LaunchedEffect(currentServer) {
-        hasAutoplayed = false
-    }
 
     LaunchedEffect(isSidebarVisible) {
         if (isSidebarVisible) {
@@ -245,100 +260,152 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
     }
 
     fun triggerAutoplay(rawChannelList: List<OmniChannel>) {
-        val channelList = filterChannelList(rawChannelList)
-        val autoFirst = prefManager.myPrefs.omniAutoplayFirstChannel
-        val autoLast = prefManager.myPrefs.omniAutoplayLastChannel
-        val lastPlayedUrl = prefManager.myPrefs.currChannelUrl?.trim().orEmpty()
-        val lastPlayedName = prefManager.myPrefs.currChannelName?.trim().orEmpty()
+        if (hasAutoplayed || startupMode == StartupChannelMode.NONE || rawChannelList.isEmpty()) return
 
-        LogCollector.log("Omni: Checking Autoplay -> autoFirst: $autoFirst, autoLast: $autoLast, hasAutoplayed: $hasAutoplayed, filtered channelList size: ${channelList.size}, lastChannel: '$lastPlayedName'")
+        val filteredChannelList = filterChannelList(rawChannelList)
+        val targetChannel = when (startupMode) {
+            StartupChannelMode.LAST_PLAYED -> resolveLastPlayedChannel(
+                rawChannelList,
+                prefManager.myPrefs.omniLastPlayedChannelId,
+                prefManager.myPrefs.currChannelName,
+                prefManager.myPrefs.currChannelUrl
+            ) ?: if (prefManager.myPrefs.omniLegacyFirstFallback) filteredChannelList.firstOrNull() else null
+            StartupChannelMode.FIXED_CHANNEL -> resolveFixedChannel(
+                rawChannelList,
+                prefManager.myPrefs.omniStartupFixedChannelId
+            )
+            StartupChannelMode.LEGACY_FIRST -> filteredChannelList.firstOrNull()
+            StartupChannelMode.NONE -> null
+        }
 
-        if (hasAutoplayed || channelList.isEmpty()) return
-        if (!autoFirst && !autoLast) return
-
-        val targetChannel = if (autoLast && (lastPlayedUrl.isNotBlank() || lastPlayedName.isNotBlank())) {
-            channelList.find { ch ->
-                (lastPlayedName.isNotBlank() && ch.name?.trim().equals(lastPlayedName, ignoreCase = true)) ||
-                (lastPlayedUrl.isNotBlank() && (
-                    ch.url?.equals(lastPlayedUrl, ignoreCase = true) == true ||
-                    ch.m3u8Url?.equals(lastPlayedUrl, ignoreCase = true) == true ||
-                    ch.mpdUrl?.equals(lastPlayedUrl, ignoreCase = true) == true ||
-                    (ch.id != null && lastPlayedUrl.contains(ch.id!!))
-                ))
-            } ?: if (autoFirst) channelList.firstOrNull() else null
-        } else if (autoFirst) {
-            channelList.firstOrNull()
-        } else null
-
-        if (targetChannel != null) {
+        if (targetChannel == null) {
             hasAutoplayed = true
-            val targetIndex = channelList.indexOf(targetChannel).coerceAtLeast(0)
-            LogCollector.log("Omni: Autoplaying channel '${targetChannel.name}' on server '${currentServer.name}' (index: $targetIndex in ${channelList.size} filtered channels)")
-            OmniDataManager.currentChannelList = channelList
-            try {
-                PlayerCommandBus.requestClosePip()
-            } catch (_: Exception) {}
-            val intent = Intent(context, OmniPlayerActivity::class.java).apply {
-                putExtra("channel_index", targetIndex)
+            startupNotice = when (startupMode) {
+                StartupChannelMode.FIXED_CHANNEL -> "Selected startup channel is unavailable. Choose another in Settings."
+                StartupChannelMode.LAST_PLAYED -> "No saved last-played channel is available."
+                StartupChannelMode.LEGACY_FIRST -> "No channel matches the current filters."
+                StartupChannelMode.NONE -> null
             }
-            context.startActivity(intent)
-        } else {
-            LogCollector.log("Omni: Autoplay found no matching target channel in ${channelList.size} filtered channels")
+            onStartupChannelsLoaded()
+            return
+        }
+
+        hasAutoplayed = true
+        startupNotice = null
+        val playerChannels = if (startupMode == StartupChannelMode.LEGACY_FIRST) filteredChannelList else rawChannelList
+        val targetIndex = playerChannels.indexOf(targetChannel)
+        if (targetIndex < 0) return
+
+        LogCollector.log("Omni: Starting '${targetChannel.name}' from startup mode $startupMode")
+        OmniDataManager.currentChannelList = playerChannels
+        try {
+            PlayerCommandBus.requestClosePip()
+        } catch (_: Exception) {}
+        val intent = Intent(context, OmniPlayerActivity::class.java).apply {
+            putExtra("channel_index", targetIndex)
+        }
+        context.startActivity(intent)
+        onStartupChannelsLoaded()
+    }
+
+    fun saveStartupMode(mode: StartupChannelMode) {
+        startupMode = mode
+        startupNotice = null
+        hasAutoplayed = true
+        prefManager.myPrefs.omniStartupChannelMode = mode.preferenceValue
+        prefManager.myPrefs.omniLegacyFirstFallback = false
+        prefManager.myPrefs.omniAutoplayFirstChannel = false
+        prefManager.myPrefs.omniAutoplayLastChannel = false
+        prefManager.savePreferences()
+        settingsUpdateTrigger++
+    }
+
+    fun openFixedChannelPicker() {
+        showStartupChannelDialog = false
+        showFixedChannelDialog = true
+        if (!startupReady) return
+        isLoadingFixedChannels = true
+        scope.launch {
+            try {
+                val fetched = withContext(Dispatchers.IO) {
+                    repository.fetchChannels(port, forceRefresh = true)
+                }
+                fullChannelList = fetched
+                if (currentServer.url != FAVORITES_SERVER_URL) channels = fetched
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                startupNotice = "Could not load channels: ${e.localizedMessage ?: "Try again later."}"
+            } finally {
+                isLoadingFixedChannels = false
+            }
         }
     }
 
-    // Load channels on server change or favorites refresh
-    LaunchedEffect(currentServer, favoriteRefreshTick) {
-        if (currentServer.url == FAVORITES_SERVER_URL) {
-            LogCollector.log("Omni: Loading Favorites server channels")
-            if (fullChannelList.isEmpty()) {
-                try {
-                    fullChannelList = withContext(Dispatchers.IO) { repository.fetchChannels(port) }
-                } catch (_: Exception) {}
-            }
-            val favs = favoritesStore.load()
-            if (fullChannelList.isNotEmpty()) {
-                val favMap = favs.associateBy { it.name }
-                channels = fullChannelList.filter { favMap.containsKey(it.name) }
-            } else {
-                channels = favs.map { fav ->
-                    OmniChannel(
-                        id = fav.id,
-                        name = fav.name,
-                        group = "Favorites",
-                        language = "Hindi",
-                        logo = null,
-                        url = fav.url,
-                        m3u8Url = fav.url,
-                        mpdUrl = null,
-                        licenseUrl = null,
-                        requiresSubscription = false
-                    )
+    LaunchedEffect(currentServer, favoriteRefreshTick, startupReady) {
+        if (!startupReady) {
+            isLoading = false
+            return@LaunchedEffect
+        }
+
+        isLoading = true
+        errorMessage = null
+        try {
+            var freshStartupChannels: List<OmniChannel>? = null
+            if (startupMode != StartupChannelMode.NONE && !hasAutoplayed) {
+                freshStartupChannels = withContext(Dispatchers.IO) {
+                    repository.fetchChannels(port, forceRefresh = true)
+                }
+                fullChannelList = freshStartupChannels
+                if (freshStartupChannels.isEmpty()) {
+                    hasAutoplayed = true
+                    startupNotice = "No channels were returned by the TV service."
+                } else {
+                    triggerAutoplay(freshStartupChannels)
                 }
             }
-            isLoading = false
-            errorMessage = null
-            LogCollector.log("Omni: Loaded ${channels.size} favorite channels")
-            triggerAutoplay(channels)
-        } else {
-            isLoading = true
-            errorMessage = null
-            try {
-                LogCollector.log("Omni: Fetching channels from server: ${currentServer.name} (Port: $port)")
-                val fetched = withContext(Dispatchers.IO) { repository.fetchChannels(port) }
+
+            if (currentServer.url == FAVORITES_SERVER_URL) {
+                if (fullChannelList.isEmpty()) {
+                    fullChannelList = withContext(Dispatchers.IO) { repository.fetchChannels(port) }
+                }
+                val favs = favoritesStore.load()
+                channels = if (fullChannelList.isNotEmpty()) {
+                    val favMap = favs.associateBy { it.name }
+                    fullChannelList.filter { favMap.containsKey(it.name) }
+                } else {
+                    favs.map { fav ->
+                        OmniChannel(
+                            id = fav.id,
+                            name = fav.name,
+                            group = "Favorites",
+                            language = "Hindi",
+                            logo = null,
+                            url = fav.url,
+                            m3u8Url = fav.url,
+                            mpdUrl = null,
+                            licenseUrl = null,
+                            requiresSubscription = false
+                        )
+                    }
+                }
+            } else {
+                val fetched = freshStartupChannels ?: withContext(Dispatchers.IO) {
+                    repository.fetchChannels(port)
+                }
                 fullChannelList = fetched
                 channels = fetched
-                if (fetched.isEmpty()) {
-                    errorMessage = "No channels found."
-                    LogCollector.log("Omni: Channels fetch returned empty list.")
-                } else {
-                    LogCollector.log("Omni: Successfully loaded ${fetched.size} channels from ${currentServer.name}")
-                    triggerAutoplay(fetched)
-                }
-            } catch (e: Exception) {
-                errorMessage = e.localizedMessage ?: "Failed to load channels."
-                LogCollector.logError("Omni: Failed to load channels from server", e)
+                if (fetched.isEmpty()) errorMessage = "No channels found."
             }
+            LogCollector.log("Omni: Loaded ${channels.size} channels from ${currentServer.name}")
+            onStartupChannelsLoaded()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            errorMessage = e.localizedMessage ?: "Failed to load channels."
+            LogCollector.logError("Omni: Failed to load channels from server", e)
+            onStartupChannelsLoaded()
+        } finally {
             isLoading = false
         }
     }
@@ -541,19 +608,32 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
                     }
 
                     item {
-                        var checked by remember(settingsUpdateTrigger) { mutableStateOf(prefManager.myPrefs.omniAutoplayFirstChannel) }
-                        OmniSettingsToggle("Autoplay: First Channel", checked) {
-                            checked = it
-                            prefManager.myPrefs.omniAutoplayFirstChannel = it
-                            prefManager.savePreferences()
+                        val startupLabel = when (startupMode) {
+                            StartupChannelMode.LAST_PLAYED -> "Last Played"
+                            StartupChannelMode.FIXED_CHANNEL -> "Fixed Channel: ${prefManager.myPrefs.omniStartupFixedChannelName?.ifBlank { "Choose a channel" } ?: "Choose a channel"}"
+                            StartupChannelMode.NONE -> "None"
+                            StartupChannelMode.LEGACY_FIRST -> "First Channel (existing)"
                         }
-                    }
-                    item {
-                        var checked by remember(settingsUpdateTrigger) { mutableStateOf(prefManager.myPrefs.omniAutoplayLastChannel) }
-                        OmniSettingsToggle("Autoplay: Last Played", checked) {
-                            checked = it
-                            prefManager.myPrefs.omniAutoplayLastChannel = it
-                            prefManager.savePreferences()
+                        Column {
+                            OmniSettingsActionItem("Startup Channel: $startupLabel", Icons.Default.PlayArrow, enabled = true) {
+                                showStartupChannelDialog = true
+                            }
+                            if (startupMode != StartupChannelMode.NONE && !prefManager.myPrefs.omniAutoStartAppOnBoot) {
+                                Text(
+                                    "Enable Autostart on Boot for playback after power-on.",
+                                    modifier = Modifier.padding(start = 14.dp, bottom = 4.dp),
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
+                                    fontSize = 11.sp
+                                )
+                            }
+                            if (startupMode == StartupChannelMode.LAST_PLAYED && prefManager.myPrefs.omniLegacyFirstFallback) {
+                                Text(
+                                    "Your previous First Channel fallback is being preserved.",
+                                    modifier = Modifier.padding(start = 14.dp, bottom = 4.dp),
+                                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.65f),
+                                    fontSize = 11.sp
+                                )
+                            }
                         }
                     }
                     item {
@@ -624,6 +704,13 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
                             prefManager.myPrefs.freeJioCatchup = false
                             prefManager.myPrefs.omniAutoplayFirstChannel = false
                             prefManager.myPrefs.omniAutoplayLastChannel = false
+                            prefManager.myPrefs.omniStartupChannelMode = StartupChannelMode.NONE.preferenceValue
+                            prefManager.myPrefs.omniStartupFixedChannelId = ""
+                            prefManager.myPrefs.omniStartupFixedChannelName = ""
+                            prefManager.myPrefs.omniLegacyFirstFallback = false
+                            startupMode = StartupChannelMode.NONE
+                            startupNotice = null
+                            hasAutoplayed = true
                             prefManager.myPrefs.enablePip = false
                             prefManager.myPrefs.darkMODE = true
                             prefManager.myPrefs.omniEnableSwipeGestures = true
@@ -669,6 +756,29 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
                 .fillMaxSize()
                 .padding(start = if (isTv && isSidebarVisible) drawerWidth else 0.dp)
         ) {
+            if (startupStatus != null || startupNotice != null || !startupReady) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 4.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = startupStatus ?: startupNotice ?: "TV service is not ready.",
+                            modifier = Modifier.weight(1f),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            fontSize = 13.sp
+                        )
+                        if (!startupReady && (startupRetryAvailable || startupStatus == null)) {
+                            TextButton(onClick = onRetryStartup) { Text("Retry") }
+                        }
+                    }
+                }
+            }
+
             // Top bar: search toggle / server name / menu icon
             Box(
                 modifier = Modifier
@@ -975,6 +1085,11 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
 
             // --- CHANNEL CONTENT GRID ---
             when {
+                !startupReady -> {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        if (startupStatus != null) CircularProgressIndicator(color = MaterialTheme.colorScheme.primary)
+                    }
+                }
                 isLoading -> {
                     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -1036,13 +1151,26 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
                                         isLoading = true
                                         try {
                                             LogCollector.log("Omni: Retrying channel fetch from server: ${currentServer.name}")
-                                            channels = withContext(Dispatchers.IO) { repository.fetchChannels(port) }
-                                            errorMessage = null
+                                            val fetched = withContext(Dispatchers.IO) {
+                                                repository.fetchChannels(port, forceRefresh = startupMode != StartupChannelMode.NONE)
+                                            }
+                                            fullChannelList = fetched
+                                            channels = fetched
+                                            errorMessage = if (fetched.isEmpty()) "No channels found." else null
+                                            if (startupMode != StartupChannelMode.NONE && fetched.isNotEmpty()) {
+                                                hasAutoplayed = false
+                                                startupNotice = null
+                                                triggerAutoplay(fetched)
+                                            }
+                                            onStartupChannelsLoaded()
+                                        } catch (e: CancellationException) {
+                                            throw e
                                         } catch (e: Exception) {
                                             errorMessage = e.localizedMessage
                                             LogCollector.logError("Omni: Retry failed", e)
+                                        } finally {
+                                            isLoading = false
                                         }
-                                        isLoading = false
                                     }
                                 },
                                 colors = ButtonDefaults.buttonColors(
@@ -1157,6 +1285,103 @@ fun OmniMainScreen(context: Context, onNavigate: (String) -> Unit) {
                 filteredChannels = filteredChannels
             )
         }
+    }
+
+    if (showStartupChannelDialog) {
+        val modes = buildList {
+            add(StartupChannelMode.LAST_PLAYED)
+            add(StartupChannelMode.FIXED_CHANNEL)
+            add(StartupChannelMode.NONE)
+            if (startupMode == StartupChannelMode.LEGACY_FIRST) add(StartupChannelMode.LEGACY_FIRST)
+        }
+        AlertDialog(
+            onDismissRequest = { showStartupChannelDialog = false },
+            title = { Text("Startup Channel") },
+            text = {
+                Column {
+                    modes.forEach { mode ->
+                        val label = when (mode) {
+                            StartupChannelMode.LAST_PLAYED -> "Last Played"
+                            StartupChannelMode.FIXED_CHANNEL -> "Fixed Channel"
+                            StartupChannelMode.NONE -> "None"
+                            StartupChannelMode.LEGACY_FIRST -> "First Channel (existing)"
+                        }
+                        TextButton(
+                            onClick = {
+                                if (mode == StartupChannelMode.FIXED_CHANNEL) {
+                                    openFixedChannelPicker()
+                                } else if (mode == StartupChannelMode.LEGACY_FIRST) {
+                                    startupMode = mode
+                                    hasAutoplayed = true
+                                    prefManager.myPrefs.omniStartupChannelMode = mode.preferenceValue
+                                    prefManager.myPrefs.omniAutoplayFirstChannel = true
+                                    prefManager.myPrefs.omniAutoplayLastChannel = false
+                                    prefManager.myPrefs.omniLegacyFirstFallback = false
+                                    prefManager.savePreferences()
+                                    showStartupChannelDialog = false
+                                } else {
+                                    saveStartupMode(mode)
+                                    showStartupChannelDialog = false
+                                }
+                            }
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = startupMode == mode, onClick = null)
+                                Text(label)
+                            }
+                        }
+                    }
+                    if (startupMode == StartupChannelMode.LAST_PLAYED && prefManager.myPrefs.omniLegacyFirstFallback) {
+                        Text(
+                            "The old First Channel fallback remains active until a new mode is selected.",
+                            modifier = Modifier.padding(start = 12.dp),
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showStartupChannelDialog = false }) { Text("Close") }
+            }
+        )
+    }
+
+    if (showFixedChannelDialog) {
+        val fixedChannels = fullChannelList.filter { !it.id.isNullOrBlank() }
+        AlertDialog(
+            onDismissRequest = { showFixedChannelDialog = false },
+            title = { Text("Choose Startup Channel") },
+            text = {
+                when {
+                    !startupReady -> Text("Start the TV service, then reopen this picker.")
+                    isLoadingFixedChannels -> CircularProgressIndicator()
+                    fixedChannels.isEmpty() -> Text("No channels with a stable ID are available.")
+                    else -> LazyColumn(modifier = Modifier.heightIn(max = 380.dp)) {
+                        items(fixedChannels) { channel ->
+                            TextButton(
+                                onClick = {
+                                    prefManager.myPrefs.omniStartupFixedChannelId = channel.id.orEmpty()
+                                    prefManager.myPrefs.omniStartupFixedChannelName = channel.name.orEmpty()
+                                    saveStartupMode(StartupChannelMode.FIXED_CHANNEL)
+                                    showFixedChannelDialog = false
+                                }
+                            ) {
+                                Text(channel.name ?: "Unnamed channel", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showFixedChannelDialog = false }) { Text("Close") }
+            },
+            dismissButton = if (startupReady && !isLoadingFixedChannels) {
+                {
+                    TextButton(onClick = { openFixedChannelPicker() }) { Text("Refresh") }
+                }
+            } else null
+        )
     }
 
     // Category Filter Dialog

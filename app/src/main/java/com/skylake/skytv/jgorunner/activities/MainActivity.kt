@@ -9,7 +9,9 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.LinkProperties
+import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -45,6 +47,7 @@ import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.fragment.app.FragmentActivity
 import com.skylake.skytv.jgorunner.BuildConfig
 import com.skylake.skytv.jgorunner.activities.setup_wizard.SetupWizardActivity
+import com.skylake.skytv.jgorunner.core.LocalServerProbeStatus
 import com.skylake.skytv.jgorunner.core.checkServerStatus
 import com.skylake.skytv.jgorunner.core.data.JTVConfigurationManager
 import com.skylake.skytv.jgorunner.core.execution.runBinary
@@ -56,6 +59,8 @@ import com.skylake.skytv.jgorunner.core.update.DownloadProgress
 import com.skylake.skytv.jgorunner.core.update.SemanticVersionNew
 import com.skylake.skytv.jgorunner.core.update.Status
 import com.skylake.skytv.jgorunner.data.SkySharedPref
+import com.skylake.skytv.jgorunner.data.StartupChannelMode
+import com.skylake.skytv.jgorunner.data.migrateLegacyStartupSelection
 import com.skylake.skytv.jgorunner.services.BinaryService
 import com.skylake.skytv.jgorunner.services.player.LandingPage
 import com.skylake.skytv.jgorunner.ui.components.BottomNavigationBar
@@ -76,11 +81,17 @@ import com.skylake.skytv.jgorunner.ui.screens.SettingsScreen
 import com.skylake.skytv.jgorunner.ui.screens.ZoneScreen
 import com.skylake.skytv.jgorunner.ui.theme.JGOTheme
 import com.skylake.skytv.jgorunner.services.CastManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.resume
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -103,6 +114,11 @@ class MainActivity : FragmentActivity() {
     private var currentScreen by mutableStateOf("Home") // Manage current screen
 
     private val executor = Executors.newSingleThreadExecutor()
+    private val mainActivityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var startupRecoveryJob: Job? = null
+    private var startupStatus by mutableStateOf<String?>(null)
+    private var startupReady by mutableStateOf(false)
+    private var startupRetryAvailable by mutableStateOf(false)
     private var showBinaryUpdatePopup by mutableStateOf(false)
     private var showAppUpdatePopup by mutableStateOf(false)
     private var showLoginPopup by mutableStateOf(false)
@@ -128,6 +144,7 @@ class MainActivity : FragmentActivity() {
         super.onStart()
         runOnceAfterAppUpgrade()
         preferenceManager = SkySharedPref.getInstance(this)
+        migrateStartupChannelPreferences()
         BinaryUpdater.init(this)
 
 // DEL----------------------------------------------------------
@@ -219,22 +236,9 @@ class MainActivity : FragmentActivity() {
             }
         }
 
-        // Check if server should start automatically
-        val isFlagSetForAutoStartServer = preferenceManager.myPrefs.autoStartServer
-        if (isFlagSetForAutoStartServer) {
-            Log.d(TAG, "Starting server automatically")
-            val arguments = emptyArray<String>()
-            runBinary(
-                activity = this,
-                arguments = arguments,
-                onRunSuccess = {
-                    onJTVServerRun()
-                },
-                onOutput = { output ->
-                    Log.d(TAG, output)
-                    outputText = output
-                }
-            )
+        val startupMode = StartupChannelMode.fromPreference(preferenceManager.myPrefs.omniStartupChannelMode)
+        if (preferenceManager.myPrefs.autoStartServer || startupMode != StartupChannelMode.NONE) {
+            startStartupRecovery()
         }
     }
 
@@ -289,6 +293,17 @@ class MainActivity : FragmentActivity() {
                 recentChannels = backupPrefs.recentChannels,
                 selectedScreenTV = backupPrefs.selectedScreenTV,
                 selectedRemoteNavTV = backupPrefs.selectedRemoteNavTV,
+                currChannelName = backupPrefs.currChannelName,
+                currChannelUrl = backupPrefs.currChannelUrl,
+                currChannelLogo = backupPrefs.currChannelLogo,
+                omniAutoplayFirstChannel = backupPrefs.omniAutoplayFirstChannel,
+                omniAutoplayLastChannel = backupPrefs.omniAutoplayLastChannel,
+                omniStartupChannelMode = backupPrefs.omniStartupChannelMode,
+                omniStartupFixedChannelId = backupPrefs.omniStartupFixedChannelId,
+                omniStartupFixedChannelName = backupPrefs.omniStartupFixedChannelName,
+                omniLastPlayedChannelId = backupPrefs.omniLastPlayedChannelId,
+                omniLegacyFirstFallback = backupPrefs.omniLegacyFirstFallback,
+                omniAutoStartAppOnBoot = backupPrefs.omniAutoStartAppOnBoot,
 
 //                custURL = backupPrefs.custURL,
 //                channelListJson = backupPrefs.channelListJson,
@@ -309,12 +324,22 @@ class MainActivity : FragmentActivity() {
         }
     }
 
+    private fun migrateStartupChannelPreferences() {
+        val prefs = preferenceManager.myPrefs
+        if (prefs.omniStartupChannelMode != null) return
+        val migrated = migrateLegacyStartupSelection(
+            first = prefs.omniAutoplayFirstChannel,
+            last = prefs.omniAutoplayLastChannel
+        )
+        prefs.omniStartupChannelMode = migrated.mode.preferenceValue
+        prefs.omniLegacyFirstFallback = migrated.firstChannelFallback
+        preferenceManager.savePreferences()
+    }
 
     override fun onResume() {
         super.onResume()
 
-        if (isServerRunning)
-            onJTVServerRun()
+        if (BinaryService.isRunning && !startupReady) startStartupRecovery()
     }
 
     @SuppressLint("UnspecifiedRegisterReceiverFlag", "NewApi")
@@ -408,16 +433,7 @@ class MainActivity : FragmentActivity() {
                                 publicJTVServerURL = getPublicJTVServerURL(context = this@MainActivity),
                                 outputText = outputText,
                                 onRunServerButtonClick = {
-                                    runBinary(
-                                        activity = this@MainActivity,
-                                        arguments = emptyArray(),
-                                        onRunSuccess = {
-                                            onJTVServerRun()
-                                        },
-                                        onOutput = { output ->
-                                            outputText = output
-                                        }
-                                    )
+                                    startStartupRecovery(retry = true)
                                 },
                                 onStopServerButtonClick = {
                                     stopBinary(
@@ -446,6 +462,9 @@ class MainActivity : FragmentActivity() {
                                 },
                                 onOmniTvButtonClick = {
                                     currentScreen = "OmniTv"
+                                    if (preferenceManager.myPrefs.autoStartServer ||
+                                        StartupChannelMode.fromPreference(preferenceManager.myPrefs.omniStartupChannelMode) != StartupChannelMode.NONE
+                                    ) startStartupRecovery()
                                 },
                                 onExitButtonClick = {
                                     stopBinary(
@@ -508,7 +527,12 @@ class MainActivity : FragmentActivity() {
                                     context = this@MainActivity,
                                     onNavigate = { title ->
                                         currentScreen = if (title == "back") "Home" else title
-                                    }
+                                    },
+                                    startupStatus = startupStatus,
+                                    startupReady = startupReady,
+                                    startupRetryAvailable = startupRetryAvailable,
+                                    onRetryStartup = { startStartupRecovery(retry = true) },
+                                    onStartupChannelsLoaded = { startupStatus = null }
                                 )
                             }
                         }
@@ -701,6 +725,9 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onDestroy() {
+        startupRecoveryJob?.cancel()
+        countdownJob?.cancel()
+        mainActivityScope.cancel()
         super.onDestroy()
         backPressedCallback.remove()
         unregisterReceiver(binaryStoppedReceiver)
@@ -928,82 +955,143 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    private fun onJTVServerRun() {
-        // Check server status
-        val port = preferenceManager.myPrefs.jtvGoServerPort
-        CoroutineScope(Dispatchers.IO).launch {
-            checkServerStatus(
-                port = port,
-                onLoginSuccess = {
-                    isServerRunning = true
-                    isGlowBox = true
+    private fun startStartupRecovery(retry: Boolean = false) {
+        if (startupRecoveryJob?.isActive == true) return
+        if (startupReady && !retry) return
 
-                    if (preferenceManager.myPrefs.autoStartIPTV) {
-                        countdownJob?.cancel() // Cancel any existing countdown job
+        startupRecoveryJob = mainActivityScope.launch {
+            startupReady = false
+            startupRetryAvailable = false
+            startupStatus = "Starting TV..."
+            try {
+                if (!hasValidatedNetwork()) startupStatus = "Waiting for internet..."
+                if (!awaitValidatedNetwork(90_000L)) {
+                    startupStatus = "Waiting for internet. Tap Retry when connected."
+                    startupRetryAvailable = true
+                    return@launch
+                }
 
-                        var countdownTime = preferenceManager.myPrefs.iptvLaunchCountdown
-                        countdownJob = CoroutineScope(Dispatchers.Main).launch {
-                            showRedirectPopup = !isOnBuiltInIptvScreen() &&
-                                    !preferenceManager.myPrefs.iptvAppPackageName.isNullOrEmpty()
-
-
-                            shouldLaunchIPTV = true
-
-                            while (countdownTime > 0) {
-                                delay(1000)
-                                countdownTime--
-                            }
-
-                            showRedirectPopup = false
-
-                            if (shouldLaunchIPTV) {
-                                startIPTV2()
-//                                launchIPTV()
-                            }
-                        }
+                startupStatus = "Starting TV service..."
+                val serviceStarted = runBinary(
+                    activity = this@MainActivity,
+                    arguments = emptyArray(),
+                    onOutput = { output ->
+                        Log.d(TAG, output)
+                        outputText = output
                     }
-                },
-                onLoginFailure = {
-                    isGlowBox = false
-                    isServerRunning = true
-                    if (preferenceManager.myPrefs.loginChk) {
-                        showLoginPopup = true
-                    } else {
-                        if (preferenceManager.myPrefs.autoStartIPTV) {
-                            countdownJob?.cancel() // Cancel any existing countdown job
+                )
+                if (!serviceStarted) {
+                    startupStatus = "TV service did not start. Tap Retry."
+                    startupRetryAvailable = true
+                    return@launch
+                }
 
-                            var countdownTime = preferenceManager.myPrefs.iptvLaunchCountdown
-                            countdownJob = CoroutineScope(Dispatchers.Main).launch {
-                                showRedirectPopup = !isOnBuiltInIptvScreen() &&
-                                        !preferenceManager.myPrefs.iptvAppPackageName.isNullOrEmpty()
-                                shouldLaunchIPTV = true
-
-                                while (countdownTime > 0) {
-                                    delay(1000)
-                                    countdownTime--
-                                }
-
-                                showRedirectPopup = false
-
-                                if (shouldLaunchIPTV) {
-                                    startIPTV2()
-//                                    launchIPTV()
-                                }
-                            }
+                isServerRunning = BinaryService.isRunning
+                startupStatus = "Restoring channel..."
+                when (checkServerStatus(preferenceManager.myPrefs.jtvGoServerPort)) {
+                    LocalServerProbeStatus.READY -> {
+                        startupReady = true
+                        isServerRunning = true
+                        isGlowBox = true
+                        if (StartupChannelMode.fromPreference(preferenceManager.myPrefs.omniStartupChannelMode) == StartupChannelMode.NONE) {
+                            startupStatus = null
                         }
+                        startIptvAfterServerReady()
                     }
-                },
-                onServerDown = {
-                    CoroutineScope(Dispatchers.Main).launch {
-                        isServerRunning = false
+                    LocalServerProbeStatus.AUTH_REQUIRED -> {
+                        isServerRunning = true
                         isGlowBox = false
-                        Toast.makeText(this@MainActivity, "Server is down", Toast.LENGTH_SHORT)
-                            .show()
+                        startupStatus = "Login required."
+                        if (preferenceManager.myPrefs.loginChk) showLoginPopup = true
+                        else startIptvAfterServerReady()
                     }
-                },
-            )
+                    LocalServerProbeStatus.UNREACHABLE -> {
+                        isGlowBox = false
+                        startupStatus = "TV service is not responding. Tap Retry."
+                        startupRetryAvailable = true
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Startup recovery failed", e)
+                startupStatus = "TV startup failed. Tap Retry."
+                startupRetryAvailable = true
+                isGlowBox = false
+            }
         }
     }
+
+    private fun startIptvAfterServerReady() {
+        if (!preferenceManager.myPrefs.autoStartIPTV) return
+        countdownJob?.cancel()
+        var countdownTime = preferenceManager.myPrefs.iptvLaunchCountdown
+        countdownJob = mainActivityScope.launch {
+            showRedirectPopup = !isOnBuiltInIptvScreen() &&
+                !preferenceManager.myPrefs.iptvAppPackageName.isNullOrEmpty()
+            shouldLaunchIPTV = true
+            while (countdownTime > 0) {
+                delay(1000)
+                countdownTime--
+            }
+            showRedirectPopup = false
+            if (shouldLaunchIPTV) startIPTV2()
+        }
+    }
+
+    private fun hasValidatedNetwork(): Boolean {
+        val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            @Suppress("DEPRECATION")
+            return connectivityManager.activeNetworkInfo?.isConnected == true
+        }
+        val network = connectivityManager.activeNetwork ?: return false
+        val capabilities = connectivityManager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private suspend fun awaitValidatedNetwork(timeoutMillis: Long): Boolean =
+        withTimeoutOrNull(timeoutMillis) {
+            if (hasValidatedNetwork()) return@withTimeoutOrNull true
+            val connectivityManager = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            suspendCancellableCoroutine { continuation ->
+                val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+                val callback = object : ConnectivityManager.NetworkCallback() {
+                    private fun completeIfReady(capabilities: NetworkCapabilities?) {
+                        if (capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                            (Build.VERSION.SDK_INT < Build.VERSION_CODES.M || capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) &&
+                            completed.compareAndSet(false, true)
+                        ) {
+                            runCatching { connectivityManager.unregisterNetworkCallback(this) }
+                            continuation.resume(true)
+                        }
+                    }
+
+                    override fun onAvailable(network: Network) {
+                        completeIfReady(connectivityManager.getNetworkCapabilities(network))
+                    }
+
+                    override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+                        completeIfReady(networkCapabilities)
+                    }
+                }
+                continuation.invokeOnCancellation {
+                    completed.set(true)
+                    runCatching { connectivityManager.unregisterNetworkCallback(callback) }
+                }
+                try {
+                    connectivityManager.registerNetworkCallback(
+                        NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build(),
+                        callback
+                    )
+                } catch (e: Exception) {
+                    if (completed.compareAndSet(false, true) && continuation.isActive) continuation.resume(false)
+                }
+            }
+        } ?: false
 
     @RequiresApi(Build.VERSION_CODES.TIRAMISU)
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -1082,7 +1170,12 @@ class MainActivity : FragmentActivity() {
     private val binaryStoppedReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == BinaryService.ACTION_BINARY_STOPPED) {
+                startupRecoveryJob?.cancel()
+                startupReady = false
+                startupStatus = null
+                startupRetryAvailable = false
                 isServerRunning = false
+                isGlowBox = false
                 outputText = "Server stopped"
             }
         }

@@ -398,6 +398,12 @@ fun OmniPlayerScreen(
                         isBuffering = (state == Player.STATE_BUFFERING)
                         if (state == Player.STATE_READY) {
                             playerError = null
+                            activeChannel?.let { channel ->
+                                preferenceManager.myPrefs.omniLastPlayedChannelId = channel.id ?: ""
+                                preferenceManager.myPrefs.currChannelName = channel.name
+                                preferenceManager.myPrefs.currChannelUrl = channel.m3u8Url ?: channel.url
+                                preferenceManager.savePreferences()
+                            }
                             com.skylake.skytv.jgorunner.utils.LogCollector.log("OmniPlayer: Playback STATE_READY for channel: ${activeChannel?.name}")
                         }
                     }
@@ -430,10 +436,6 @@ fun OmniPlayerScreen(
             } else {
                 ch.m3u8Url ?: ch.url ?: ""
             }
-
-            preferenceManager.myPrefs.currChannelName = ch.name
-            preferenceManager.myPrefs.currChannelUrl = rawPlaybackUrl
-            preferenceManager.savePreferences()
 
             // Normalize playback URL using HelperUtils.normalizePlaybackUrl
             var playbackUrl = com.skylake.skytv.jgorunner.utils.normalizePlaybackUrl(
